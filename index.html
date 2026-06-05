@@ -1,0 +1,284 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Telegram 频道媒体搬运 · 上传下载提速 Cookbook</title>
+<style>
+  :root{
+    --bg:#0f1419; --card:#1a2027; --card2:#232b34; --fg:#e6edf3; --muted:#9aa7b2;
+    --accent:#3fb950; --accent2:#58a6ff; --warn:#d29922; --bad:#f85149; --line:#30363d;
+    --code:#0d1117;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.7 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif}
+  .wrap{max-width:980px;margin:0 auto;padding:32px 20px 80px}
+  h1{font-size:30px;margin:0 0 6px;letter-spacing:.5px}
+  h2{font-size:22px;margin:48px 0 14px;padding-bottom:8px;border-bottom:2px solid var(--line)}
+  h3{font-size:17px;margin:26px 0 10px;color:var(--accent2)}
+  .sub{color:var(--muted);font-size:15px;margin-bottom:8px}
+  a{color:var(--accent2)}
+  code{background:var(--code);padding:1.5px 6px;border-radius:5px;font-family:"SF Mono",Consolas,Menlo,monospace;font-size:13px;color:#ffa657}
+  pre{background:var(--code);border:1px solid var(--line);border-radius:10px;padding:14px 16px;overflow:auto;font-family:"SF Mono",Consolas,Menlo,monospace;font-size:12.5px;line-height:1.55}
+  pre code{background:none;padding:0;color:#c9d1d9}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:18px 20px;margin:16px 0}
+  table{width:100%;border-collapse:collapse;margin:14px 0;font-size:14px}
+  th,td{border:1px solid var(--line);padding:8px 11px;text-align:left}
+  th{background:var(--card2);font-weight:600}
+  tr:nth-child(even) td{background:rgba(255,255,255,.02)}
+  .big{color:var(--accent);font-weight:700}
+  .bad{color:var(--bad)}.warn{color:var(--warn)}.ok{color:var(--accent)}
+  .pill{display:inline-block;padding:2px 10px;border-radius:999px;font-size:12px;font-weight:600;margin-right:6px}
+  .pill.g{background:rgba(63,185,80,.15);color:var(--accent)}
+  .pill.b{background:rgba(248,81,73,.15);color:var(--bad)}
+  .pill.y{background:rgba(210,153,34,.15);color:var(--warn)}
+  .pill.u{background:rgba(88,166,255,.15);color:var(--accent2)}
+  .tldr{background:linear-gradient(135deg,#16241a,#1a2027);border:1px solid #2ea04366}
+  .toc a{display:inline-block;margin:3px 14px 3px 0;color:var(--muted)}
+  .toc a:hover{color:var(--accent2)}
+  .kpi{display:flex;gap:14px;flex-wrap:wrap;margin:16px 0}
+  .kpi div{flex:1;min-width:150px;background:var(--card2);border:1px solid var(--line);border-radius:10px;padding:14px}
+  .kpi .n{font-size:26px;font-weight:700;color:var(--accent)}
+  .kpi .l{color:var(--muted);font-size:13px}
+  blockquote{margin:14px 0;padding:10px 16px;border-left:3px solid var(--accent2);background:rgba(88,166,255,.06);color:#c9d1d9}
+  .muted{color:var(--muted)}
+  hr{border:none;border-top:1px solid var(--line);margin:30px 0}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>Telegram 频道媒体搬运 · 上传下载提速 Cookbook</h1>
+<div class="sub">用 Go + <a href="https://github.com/gotd/td">gotd</a>(MTProto user-account) 把一个/多个源频道的媒体高速搬运到目标频道，整套提速探索的工程复盘与可复用结论。</div>
+<div class="muted">实测环境：单台 VPS（上行实测 ~210 Mbps，下行 ~1.45 Gbps）；~30 个 user 账号（含 4 个 Premium）；gotd v0.116.0。</div>
+
+<div class="card tldr">
+<b>TL;DR —— 如果你只看一段</b>
+<ol style="margin:10px 0 0">
+<li>真正的"下载慢"往往是<b>你自己加的客户端限速中间件</b>（ratelimit），不是 Telegram。先排查它。</li>
+<li>单账号下载有 <b>per-account（非 per-IP）</b>的服务端限速：冷门文件 ~30-49 Mbps 封顶，连接/线程再多都撞墙。</li>
+<li>突破单账号上限的两条路：<b>① 多账号并行分块</b>（把一个文件的块分给 N 个账号，origin 冷门源 ~463、热门源 ~706 Mbps）；<b>② CDN 文件</b>用 gotd "全 client" 下载器自动走 CDN（单 Premium 同 DC ~315 Mbps）。</li>
+<li><b>上传</b>用"连接池"（绕过 ratelimit、多连接）可达 ~145 Mbps，比单连接快百倍。</li>
+<li>最终做一个<b>下载调度联动器</b>：自动用空闲账号、在"多账号并行 / 单会员 CDN"间选更快的那条。</li>
+</ol>
+</div>
+
+<h2>目录</h2>
+<div class="toc card">
+<a href="#bg">0 · 背景与目标</a>
+<a href="#cheat">1 · 结论速查表</a>
+<a href="#ratelimit">2 · 真凶：客户端 ratelimit 中间件</a>
+<a href="#threads">3 · "线程越多越慢"的真相</a>
+<a href="#upload">4 · 上传连接池 145Mbps</a>
+<a href="#multi">5 · 多账号并行分块下载</a>
+<a href="#dctrap">6 · home-DC / file-DC 致命坑</a>
+<a href="#single">7 · 单账号 origin 硬上限 ~49</a>
+<a href="#cdn">8 · CDN：单会员 315 / 热门源多号 706</a>
+<a href="#netspeed">9 · 网速计数器的单位陷阱</a>
+<a href="#scheduler">10 · 下载调度联动器</a>
+<a href="#api">11 · 关键 gotd API 速查</a>
+<a href="#pitfalls">12 · 踩坑清单</a>
+<a href="#checklist">13 · 给同类产品的 checklist</a>
+</div>
+
+<h2 id="bg">0 · 背景与目标</h2>
+<p>系统要把源频道（公开或私有）里的媒体（视频/图片/文档）<b>下载</b>下来、可选加工后<b>上传</b>到多个目标频道。媒体常是几十~几百 MB 的视频，吞吐直接决定搬运速度。一开始单账号下载只有 <span class="bad">~1.6 Mbps</span>，目标是榨干带宽。</p>
+<blockquote>关键前提：很多媒体可以用 <b>"引用秒传"</b>（<code>messages.sendMedia</code> 直接引用源文件的 <code>file_reference</code>）实现 0 下载 0 上传的服务端复制 —— 能用引用秒传就别下载。本文讨论的是<b>必须真下载真上传</b>（要重编码 / 改文件 / 源不可引用）的场景。</blockquote>
+
+<h2 id="cheat">1 · 结论速查表</h2>
+<h3>下载（单文件吞吐）</h3>
+<table>
+<tr><th>方案</th><th>Mbps</th><th>说明 / 适用</th></tr>
+<tr><td>单连接 + ratelimit 中间件(20/min)</td><td class="bad">1.6</td><td>❌ 历史"慢"的真凶：每个分块都是一次 API 调用，被掐到 20 块/分钟</td></tr>
+<tr><td>telethon tdlid 单(借)连接(origin)</td><td>32</td><td>对照组：和 gotd 单连接持平，<b>无 telethon 魔法</b></td></tr>
+<tr><td>单连接 无ratelimit(origin 冷门)</td><td>27</td><td>去掉中间件后的单连接</td></tr>
+<tr><td>单账号 连接池×4(origin)</td><td>49</td><td>单账号 origin <b>硬上限</b>；连接>4 或 worker>16 撞 flood</td></tr>
+<tr><td>单账号 跨DC(CDN 文件)</td><td class="bad">45</td><td>❌ 跨 DC 很慢，单账号下载务必<b>同 DC</b></td></tr>
+<tr><td><b>单 Premium 同DC · gotd全client(CDN 文件,thr8)</b></td><td class="big">315</td><td>✅ CDN 文件单会员号路径</td></tr>
+<tr><td><b>多账号并行分块 ×27(origin 冷门)</b></td><td class="big">463–547</td><td>✅ 自传/私有/冷门源主力</td></tr>
+<tr><td><b>多账号并行分块 ×30(热门源)</b></td><td class="big">706</td><td>✅ 热门源最快，比单会员 CDN 还快</td></tr>
+</table>
+<h3>上传</h3>
+<table>
+<tr><th>方案</th><th>Mbps</th></tr>
+<tr><td>单连接 + ratelimit</td><td class="bad">1.4</td></tr>
+<tr><td>连接池×8(无ratelimit)</td><td class="big">145</td></tr>
+</table>
+<div class="kpi">
+<div><div class="n">×290</div><div class="l">下载提速(1.6→463 备份实测端到端)</div></div>
+<div><div class="n">×100</div><div class="l">上传提速(1.4→145)</div></div>
+<div><div class="n">706<span style="font-size:14px">Mbps</span></div><div class="l">热门源多账号并行峰值</div></div>
+<div><div class="n">315<span style="font-size:14px">Mbps</span></div><div class="l">单 Premium CDN</div></div>
+</div>
+
+<h2 id="ratelimit">2 · 真凶：客户端 ratelimit 中间件</h2>
+<p>排查了半天 Telegram 限速、线程数、连接数，最后发现下载慢的<b>主因是自己加的中间件</b>。每个账号建 client 时加了：</p>
+<pre><code>tOpts.Middlewares = append(tOpts.Middlewares,
+    floodwait.NewSimpleWaiter(),                 // 这个要留
+    ratelimit.New(rate.Every(time.Minute/N), 3)) // N=rate_per_min；这个掐死了下载</code></pre>
+<p>分块下载里<b>每个 1MB 的块 = 一次 <code>upload.getFile</code> RPC</b>。当 <code>rate_per_min=20</code> 时，所有 API（含文件块）被限到 20 次/分钟 ≈ <b>20 MB/分钟 ≈ 2.7 Mbps</b>，与文件大小无关。实测：</p>
+<table>
+<tr><th></th><th>带 ratelimit(20/min)</th><th>无 ratelimit</th><th>倍数</th></tr>
+<tr><td>下载</td><td class="bad">1.6 Mbps</td><td class="ok">27 Mbps</td><td>17×</td></tr>
+<tr><td>上传</td><td class="bad">1.4 Mbps</td><td class="ok">145 Mbps</td><td>100×</td></tr>
+</table>
+<blockquote><b>结论：</b>客户端节流应该只作用于"控制面"API（解析、发消息…），<b>绝不能套在文件块 getFile/saveFilePart 上</b>。批量传输要走一条没有 ratelimit 的连接（但保留 floodwait）。</blockquote>
+
+<h2 id="threads">3 · "线程越多越慢"的真相</h2>
+<p>gotd 的 <code>downloader.WithThreads(n)</code> 名字有误导：它是<b>在同一条连接上开 n 个并发 getFile</b>（<code>parallel.go</code> 确认），<b>不是 n 条连接</b>。所以：</p>
+<ul>
+<li>单连接上并发越多 → 越容易触发 per-connection / per-account 限速 → <span class="bad">越慢</span>（实测 8 线程比 24 线程快）。</li>
+<li>要真正多连接，得用 gotd 的连接池：<code>Client.Pool(max)</code>（当前 DC，多连接）/ <code>Client.DC(ctx,dc,max)</code>（指定 DC，自动 <code>exportAuthorization</code> 转移）。</li>
+</ul>
+<blockquote>另一个老项目"单账号 300Mbps"的传说，拆开看其实是 <b>单(借用)发送器 + N worker + 1MB 块 + 块级重试 + file_reference 刷新</b>；它的代码注释自己写着「gigabit 的关键不是多客户端，而是处理 FileReferenceExpired」。在<b>相同的冷门测试文件</b>上 telethon 也只有 32 Mbps —— 没有魔法，差异全在<b>文件是否走 CDN</b>（见 §8）。</blockquote>
+
+<h2 id="upload">4 · 上传连接池 145Mbps</h2>
+<p>上传同理：单连接 + ratelimit = 1.4 Mbps。改用"当前 DC 连接池"（绕过 ratelimit、多连接）：</p>
+<pre><code>// tg.Client 上暴露一个无 ratelimit 的多连接调用器(保留 floodwait)
+func (c *Client) HomePool(conns int) (telegram.CloseInvoker, error) {
+    p, err := c.tg.Pool(int64(conns))           // 当前 DC，conns 条连接，无授权转移
+    if err != nil { return nil, err }
+    waiter := floodwait.NewSimpleWaiter()
+    return poolInvoker{Invoker: waiter.Handle(p), closer: p.Close}, nil
+}
+// 用法：upApi := gtg.NewClient(inv) 喂给 uploader → 200MB 上传 11.5s = 145Mbps</code></pre>
+<p><b>注意：</b>上传(<code>saveFilePart</code>)随连接数线性放大(8 连接=145Mbps)；下载(<code>getFile</code>)单账号则封顶（见 §7），<b>上下行不对称</b>。</p>
+
+<h2 id="multi">5 · 多账号并行分块下载（突破单账号上限）</h2>
+<p>单账号下载有 per-account 限速。关键实验：<b>4 个账号同时下载同一文件，吞吐会叠加（86 Mbps）还是平分？</b> → <b>叠加</b>。说明限速是 <span class="ok">per-account 而非 per-IP</span>（上传 145Mbps 也证明服务器 IP 本身不是瓶颈）。</p>
+<p>于是把一个文件的分块分发给 N 个账号、共享工作队列（快账号多抓）、块级重试、合并落盘 —— 这就是老项目 TDLID 的真正提速点（单 IP 多账号即可，不需要文档里吹的那套）。</p>
+<pre><code>// 共享队列把 [0,num) 块分给所有源(每源=一个账号的无ratelimit连接+该文件对该账号的位置)
+func downloadAcrossSources(ctx, sources []dlSource, size int64, dest string, chunk, perAcct int) error {
+    idxCh := make(chan int, num); for i:=0;i&lt;num;i++{ idxCh&lt;-i }; close(idxCh)
+    for _, s := range sources {            // N 个账号
+        for k:=0;k&lt;perAcct;k++ {            // 每账号 perAcct(=4) 个 worker
+            go func(s dlSource){
+                for idx := range idxCh {    // 抢块：快账号自然多抓
+                    off := int64(idx)*int64(chunk)
+                    for attempt:=0; attempt&lt;6; attempt++ {   // 块级重试，扛 FLOOD/断连
+                        r,e := s.api.UploadGetFile(ctx,&amp;tg.UploadGetFileRequest{Location:s.loc,Offset:off,Limit:chunk})
+                        if e!=nil { time.Sleep(...); continue }
+                        if fr,ok:=r.(*tg.UploadFile);ok { f.WriteAt(fr.Bytes,off); break }
+                        if _,ok:=r.(*tg.UploadFileCDNRedirect);ok { return errCDNRedirect } // 见 §8
+                    }
+                }
+            }(s)
+        }
+    }
+}</code></pre>
+<p>实测：27 账号 1GB = <b>547 Mbps</b>，400MB = 452–468 Mbps；接进备份引擎端到端(下载+连接池上传)<b>463 Mbps</b>，post 真送达。</p>
+
+<h2 id="dctrap">6 · home-DC / file-DC 致命坑</h2>
+<p>多账号下载第一版只有 <span class="bad">7/27</span> 个账号出力(161Mbps)。原因：<code>channels.getMessages</code>(取每账号自己的 file_reference)是<b>"账号元数据" RPC，必须走账号的 home DC 主连接</b>；而 <code>getFile</code> 走<b>文件所在 DC 的连接池</b>。早期两者都走了文件 DC 的池 → 跨 DC 的账号(home≠file)取不到消息被跳过。修正后 27/27 全出力。</p>
+<pre><code>// 每个账号缓存两套句柄：
+//   rawApi  = 账号主连接(home DC)  → GetChannelMessage 取 file_reference
+//   poolApi = 文件 DC 的连接池      → 仅 getFile 分块
+msg := tg.GetChannelMessage(ctx, a.rawApi, a.channel, msgID)   // ← home DC
+src := dlSource{ api: a.poolApi, loc: extract(msg).Location }  // ← file DC 池</code></pre>
+<p>另外：每文件并发取 file_reference（gather 0.3s）、连接池每趟建一次全趟复用，否则逐文件建连会拖慢吞吐。</p>
+
+<h2 id="single">7 · 单账号 origin 硬上限 ~49</h2>
+<p>对<b>冷门/自传/私有</b>文件(origin 单存储节点)，单账号无论怎么调都封顶 ~49 Mbps：</p>
+<table>
+<tr><th>连接池</th><th>worker</th><th>Mbps</th></tr>
+<tr><td>1</td><td>16</td><td>13–27</td></tr>
+<tr><td>4</td><td>16</td><td class="ok">49（甜点）</td></tr>
+<tr><td>8 / 16 / 24</td><td>16</td><td class="bad">撞墙(engine closed / 块重试失败)</td></tr>
+<tr><td>4</td><td>32 / 48 / 64</td><td class="bad">撞墙</td></tr>
+</table>
+<p>连接数 >4~7 或单连接 worker >16，Telegram 直接关连接。<b>这是 per-account 的硬限</b>，新号、老号、Premium 都一样。突破只能靠多账号(§5)或 CDN(§8)。</p>
+
+<h2 id="cdn">8 · CDN：单会员 315 / 热门源多号 706</h2>
+<p>转折点：同样是<b>单账号</b>，下载一个<b>热门公开频道</b>里的 325MB 文件 = <span class="big">315 Mbps</span>（不是 49！）。差异在于<b>热门文件被 Telegram 分发到 CDN / 多节点</b>，而自传冷门文件只在单节点。</p>
+<p>要吃到 CDN 必须用 gotd 的<b>"全 client"下载器</b>（<code>downloader.NewDownloader().Download(api, loc)</code>，api 是完整 <code>telegram.Client.API()</code>）——它的 <code>cdn.go</code> 自动处理 <code>upload.fileCdnRedirect</code> → 连 CDN DC → <code>getCdnFile</code> → 解密。<b>DC 绑定的连接池 / 手写 <code>UploadGetFile</code> 都做不到</b>（池只在一个 DC；手写收到 redirect 当成非 UploadFile → 块失败）。</p>
+<p>单会员 CDN 的<b>五要素</b>：</p>
+<table>
+<tr><td>① CDN 源</td><td>热门频道文件(gotd 自动识别 redirect)</td></tr>
+<tr><td>② gotd 全 client 下载器</td><td>非连接池、非手写</td></tr>
+<tr><td>③ <code>rate_per_min=0</code></td><td>否则被自家中间件掐到 16Mbps</td></tr>
+<tr><td>④ 同 DC 会员号</td><td>跨 DC 仅 ~45</td></tr>
+<tr><td>⑤ 线程 ≤ 8</td><td>>8 撞墙</td></tr>
+</table>
+<p>但更意外的是：<b>对热门源，多账号并行(手写 getFile)也能高速且更快</b> —— 30 账号 = <span class="big">706 Mbps</span>(> 单会员 CDN 315)。说明这些热门文件的 getFile 直接从分发节点返回普通 <code>UploadFile</code>(不强制 CDN redirect)，多账号叠加更猛。<b>纯 CDN-redirect 文件</b>才会让手写失败、必须回退单会员全 client。</p>
+<table>
+<tr><th>文件类型</th><th>多账号并行</th><th>单会员 gotd全client</th><th>选谁</th></tr>
+<tr><td>冷门/自传(origin)</td><td class="ok">463</td><td>49</td><td>多账号</td></tr>
+<tr><td>热门(分发节点)</td><td class="ok">706</td><td>315</td><td>多账号</td></tr>
+<tr><td>纯 CDN-redirect</td><td class="bad">手写失败</td><td class="ok">315</td><td>单会员</td></tr>
+</table>
+
+<h2 id="scheduler">9 · 网速计数器的单位陷阱</h2>
+<p>仪表盘"看着只有 80"而实测下载 463，一度以为计数器漏采。直接对比网卡 <code>ens7</code> 的 <code>rx_bytes</code> 增量：325MB 文件 → +328MB，<b>流量确在网卡、计数没漏</b>。真相是<b>单位</b>：后端 <code>rx_bps</code> 字段其实是<b>字节/秒</b>，而我们所有测速口径是 <b>Mbps(比特/秒)</b>，差 8 倍。34 MB/s = 272 Mbps 完全对得上。修复：采样 3s→1s（突发也采到）、仪表盘改显 Mbps。</p>
+<blockquote><b>教训：</b>带宽单位务必统一标注 b/B、bit/byte。字段名 <code>rx_bps</code> 存字节是最坑的命名。</blockquote>
+
+<h2 id="scheduler">10 · 下载调度联动器（最终架构）</h2>
+<p>把上面所有结论收敛成一个调度器：下载某频道媒体时自动选最快路径。</p>
+<pre><code>下载一条媒体：
+ ├─ 统计「空闲账号」(在线 且 未在执行别的下载/上传任务)
+ ├─ 建多账号下载池(只用空闲号，占用它们)
+ ├─ 估算 estMulti = N空闲 × ~17Mbps  vs  CDN单会员 ~300Mbps
+ ├─ 路径A 多账号并行分块(origin/热门最快)：
+ │     成功 → 用之(冷门463 / 热门706)
+ │     收到 CDN redirect(errCDNRedirect) → 转路径B
+ └─ 路径B 单会员·同DC·gotd全client(自动解 CDN + 跨DC迁移)：
+       pickSameDCPremium(同DC+会员+rate0+空闲) → ~315；无则用执行号兜底</code></pre>
+<p>账号忙闲用计数 map 跟踪(<code>acctAcquire/Release</code>)，建池只挑 <code>idleOnlineIDs</code>，关池释放。这样多个备份/下载任务并行时不会互抢同一批账号。</p>
+<pre><code>func (w *Worker) smartDownloadMedia(ctx, userID, mdl, fallbackApi, msg, media, dest, threads) (plan string, bytes int64, err error) {
+    n := len(mdl.accts)
+    if n &gt;= 2 &amp;&amp; float64(n)*17 &gt;= 49 {        // 号够多 → 先多账号并行
+        b, e := w.mdlDownload(ctx, mdl, msg.ID, dest, 1024, 4)
+        if e == nil { return fmt.Sprintf("multi-%dacc", n), b, nil }
+        if !errors.Is(e, errCDNRedirect) { /* 真失败,继续兜底 */ }
+    }
+    // CDN / 无多号 / 多号失败 → 单会员同DC全client
+    return w.singleClientDownload(ctx, userID, fallbackApi, media, dest, min(threads,8))
+}</code></pre>
+<p>实测 <code>@热门源 325MB</code> → 调度自动选 <code>multi-30acc</code> = <b>706 Mbps</b>。</p>
+
+<h2 id="api">11 · 关键 gotd API 速查</h2>
+<table>
+<tr><th>需求</th><th>API</th></tr>
+<tr><td>当前 DC 多连接(无授权转移)</td><td><code>Client.Pool(max int64)</code></td></tr>
+<tr><td>指定 DC 多连接(自动 exportAuthorization 转移)</td><td><code>Client.DC(ctx, dc, max)</code>；<b>转移到自身 home DC 会 DC_ID_INVALID → 回退 Pool</b></td></tr>
+<tr><td>媒体专用 DC</td><td><code>Client.MediaOnly(ctx, dc, max)</code>(跨 DC 才有意义)</td></tr>
+<tr><td>给连接池套 floodwait + 保留 Close</td><td>自封装 <code>poolInvoker{ tg.Invoker; closer func()error }</code> + <code>waiter.Handle(p)</code></td></tr>
+<tr><td>下载(自动处理 CDN + DC 迁移)</td><td><code>downloader.NewDownloader().WithPartSize(1MB).Download(api,loc).WithThreads(n).ToPath()</code></td></tr>
+<tr><td>手写分块(多账号用)</td><td><code>api.UploadGetFile(&amp;UploadGetFileRequest{Location,Offset,Limit})</code> → <code>*UploadFile</code> / <code>*UploadFileCDNRedirect</code></td></tr>
+<tr><td>引用秒传(0 带宽)</td><td><code>api.MessagesSendMedia</code> + <code>InputMediaDocument{InputDocument{ID,AccessHash,FileReference}}</code></td></tr>
+<tr><td>取消息(home DC)</td><td><code>api.ChannelsGetMessages</code></td></tr>
+</table>
+<p>分块大小：getFile 上限 1MB(<code>WithPartSize(1024*1024)</code>)；saveFilePart 上限 512KB。</p>
+
+<h2 id="pitfalls">12 · 踩坑清单</h2>
+<ul>
+<li><b>per-account ≠ per-IP</b>：单 IP 上多账号下载吞吐叠加，是多账号方案成立的前提。</li>
+<li><b>跨 DC 下载很慢</b>：单账号下载务必挑"home DC = 文件 DC"的号；跨 DC 从 45 起步。</li>
+<li><b>连接池解不了 CDN</b>：CDN 文件只能用完整 client 的下载器；池/手写会 context canceled / 块失败。</li>
+<li><b>导入的无代理账号默认不自动上线</b>：claimLoop 只认 <code>need_relogin</code> / 有代理 / 之前上过线(tg_user_id≠0)。<code>UPDATE accounts SET state='need_relogin'</code> 即可(有效 session → 秒上线免验证码)。</li>
+<li><b>会员号要 <code>rate_per_min=0</code></b>，否则 CDN 单会员被自家中间件掐到 16Mbps。</li>
+<li><b>部署二进制被截断</b>：旧 worker 在跑高并发下载会吃满上行 → scp 新二进制传一半 → systemd "Text file busy"/203 崩溃循环。部署脚本必须先 <code>systemctl stop</code> + 传完用 <code>stat -c%s</code> 校验大小再 <code>mv</code>。</li>
+<li><b>大流量瞬时 502</b>：下载突发期间 API 偶发 502，登录/轮询要带重试。长任务用"发布即返回 req_id + 轮询取结果"，别长挂 HTTP 连接。</li>
+<li><b>PowerShell 坑</b>：大负数 int64 被当 double → 科学计数 → Go json 解析失败(JSON 手拼字符串)；含 <code>()</code> 的 SQL 经 plink→bash 易被解析(写文件 <code>psql -f</code>)。</li>
+<li><b>网速单位</b>：字段叫 *_bps 却存字节/秒，差 8 倍，务必统一。</li>
+</ul>
+
+<h2 id="checklist">13 · 给同类产品的 checklist</h2>
+<div class="card">
+<ol>
+<li><span class="pill u">必做</span> 文件块传输走<b>无 ratelimit</b> 连接(保留 floodwait)；ratelimit 只套控制面。</li>
+<li><span class="pill u">必做</span> 能引用秒传(<code>sendMedia</code> 引文件)就别下载 —— 0 带宽。</li>
+<li><span class="pill g">下载</span> 准备两条路：<b>多账号并行分块</b>(冷门/私有源)+ <b>gotd 全 client</b>(CDN/热门源)。</li>
+<li><span class="pill g">下载</span> 多账号：home-DC 取消息、file-DC 取块；共享队列；块级重试；池每趟建一次。</li>
+<li><span class="pill g">下载</span> 单会员路径选<b>同 DC</b> Premium、<code>rate_per_min=0</code>、线程 ≤8。</li>
+<li><span class="pill y">上传</span> 用当前 DC 连接池(8 连接)→ ~145Mbps。</li>
+<li><span class="pill b">调度</span> 跟踪账号忙闲，只调度空闲号；多任务并行不互抢。</li>
+<li><span class="pill b">运维</span> 部署 <code>stat -c%s</code> 校验大小；长任务 publish+poll；带宽单位统一标 Mbps。</li>
+</ol>
+</div>
+
+<hr>
+<p class="muted">本 cookbook 由"王之矩阵"(Telegram 频道搬运矩阵) 项目的提速实战复盘整理。数据均为单台 VPS + 真实 user 账号实测，可能随 Telegram 策略、地域、文件冷热而变化，请以你自己的实测为准。</p>
+
+</div>
+</body>
+</html>
